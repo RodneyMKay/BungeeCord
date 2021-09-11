@@ -32,6 +32,7 @@ import net.md_5.bungee.api.CommandSender;
 import net.md_5.bungee.api.ProxyServer;
 import net.md_5.bungee.api.connection.ProxiedPlayer;
 import net.md_5.bungee.event.EventBus;
+import net.md_5.bungee.event.EventExecutor;
 import net.md_5.bungee.event.EventHandler;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.Constructor;
@@ -424,6 +425,42 @@ public final class PluginManager
     }
 
     /**
+     * Register a {@link EventExecutor} for receiving called events. The order in which
+     * multiple executors on the same event are executed in is determined through the priority.
+     * Additionally, this {@link EventExecutor} will be bound the specified {@link Listener},
+     * to allow for easier un-registration through {@link #unregisterListener(Listener)}.
+     *
+     * @param plugin the owning plugin
+     * @param listener listener this executor is registered on
+     * @param eventClass class of the event which is being listened to
+     * @param priority priority of the event executor
+     * @param eventExecutor the event executor to be executed when the event is executed
+     * @param <T> type of the event
+     * @see net.md_5.bungee.event.EventPriority for priority reference
+     */
+    public <T extends Event> void registerEventExecutor(Plugin plugin, Listener listener, Class<T> eventClass, byte priority, EventExecutor<T> eventExecutor)
+    {
+        eventBus.register( listener, eventClass, priority, eventExecutor );
+        listenersByPlugin.put( plugin, listener );
+    }
+
+    /**
+     * Register a {@link EventExecutor} for receiving called events. The order in which
+     * multiple executors on the same event are executed in is determined through the priority.
+     *
+     * @param plugin the owning plugin
+     * @param eventClass class of the event which is being listened to
+     * @param priority priority of the event executor
+     * @param eventExecutor the event executor to be executed when the event is executed
+     * @param <T> type of the event
+     * @see net.md_5.bungee.event.EventPriority for priority reference
+     */
+    public <T extends Event> void registerEventExecutor(Plugin plugin, Class<T> eventClass, byte priority, EventExecutor<T> eventExecutor)
+    {
+        eventBus.register( plugin, eventClass, priority, eventExecutor );
+    }
+
+    /**
      * Register a {@link Listener} for receiving called events. Methods in this
      * Object which wish to receive events must be annotated with the
      * {@link EventHandler} annotation.
@@ -460,6 +497,10 @@ public final class PluginManager
      */
     public void unregisterListeners(Plugin plugin)
     {
+        // Plugin itself can serve as a listener for events registered through
+        // registerEventExecutor(Plugin, Class, byte, EventExecutor)
+        eventBus.unregister( plugin );
+
         for ( Iterator<Listener> it = listenersByPlugin.get( plugin ).iterator(); it.hasNext(); )
         {
             eventBus.unregister( it.next() );

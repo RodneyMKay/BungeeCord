@@ -1,12 +1,11 @@
 package net.md_5.bungee.event;
 
 import com.google.common.collect.ImmutableSet;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.text.MessageFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -15,12 +14,15 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import lombok.Value;
 
 public class EventBus
 {
 
-    private final Map<Class<?>, Map<Byte, Map<Object, Method[]>>> byListenerAndPriority = new HashMap<>();
-    private final Map<Class<?>, EventHandlerMethod[]> byEventBaked = new ConcurrentHashMap<>();
+    private static final Comparator<EventRegistration> PRIORITY_COMPARATOR = Comparator.comparing( EventRegistration::getPriority );
+
+    private final Map<Object, List<EventRegistration>> byListener = new HashMap<>();
+    private final Map<Class<?>, EventRegistration[]> byEventSorted = new ConcurrentHashMap<>();
     private final Lock lock = new ReentrantLock();
     private final Logger logger;
 
@@ -34,35 +36,29 @@ public class EventBus
         this.logger = ( logger == null ) ? Logger.getLogger( Logger.GLOBAL_LOGGER_NAME ) : logger;
     }
 
-    public void post(Object event)
+    // Generics are erased at runtime anyways, and we check for compatibility when the event is registered
+    @SuppressWarnings("unchecked")
+    public <T> void post(T event)
     {
-        EventHandlerMethod[] handlers = byEventBaked.get( event.getClass() );
+        EventRegistration[] registrations = byEventSorted.get( event.getClass() );
 
-        if ( handlers != null )
+        if ( registrations != null )
         {
-            for ( EventHandlerMethod method : handlers )
+            for ( EventRegistration registration : registrations )
             {
-                try
-                {
-                    method.invoke( event );
-                } catch ( IllegalAccessException ex )
-                {
-                    throw new Error( "Method became inaccessible: " + event, ex );
-                } catch ( IllegalArgumentException ex )
-                {
-                    throw new Error( "Method rejected target/argument: " + event, ex );
-                } catch ( InvocationTargetException ex )
-                {
-                    logger.log( Level.WARNING, MessageFormat.format( "Error dispatching event {0} to listener {1}", event, method.getListener() ), ex.getCause() );
-                }
+                ( (EventExecutor<T>) registration.executor ).execute( event );
             }
         }
     }
 
-    private Map<Class<?>, Map<Byte, Set<Method>>> findHandlers(Object listener)
+    private List<EventRegistration> discoverRegistrationsFor(Object listener)
     {
-        Map<Class<?>, Map<Byte, Set<Method>>> handler = new HashMap<>();
-        Set<Method> methods = ImmutableSet.<Method>builder().add( listener.getClass().getMethods() ).add( listener.getClass().getDeclaredMethods() ).build();
+        List<EventRegistration> registrations = new ArrayList<>();
+        Set<Method> methods = ImmutableSet.<Method>builder()
+                .add( listener.getClass().getMethods() )
+                .add( listener.getClass().getDeclaredMethods() )
+                .build();
+
         for ( final Method m : methods )
         {
             EventHandler annotation = m.getAnnotation( EventHandler.class );
@@ -77,85 +73,117 @@ public class EventBus
                     } );
                     continue;
                 }
-                Map<Byte, Set<Method>> prioritiesMap = handler.get( params[0] );
-                if ( prioritiesMap == null )
-                {
-                    prioritiesMap = new HashMap<>();
-                    handler.put( params[0], prioritiesMap );
-                }
-                Set<Method> priority = prioritiesMap.get( annotation.priority() );
-                if ( priority == null )
-                {
-                    priority = new HashSet<>();
-                    prioritiesMap.put( annotation.priority(), priority );
-                }
-                priority.add( m );
+
+                EventExecutor<?> executor = new EventExecutorMethod( logger, listener, m );
+                registrations.add( new EventRegistration( listener, params[0], annotation.priority(), executor ) );
             }
         }
-        return handler;
+
+        return registrations;
+    }
+
+    public <T> void register(Object listener, Class<T> eventClass, byte priority, EventExecutor<T> executor)
+    {
+        lock.lock();
+        try
+        {
+            EventRegistration registration = new EventRegistration( listener, eventClass, priority, executor );
+            register( registration );
+            byListener.computeIfAbsent( listener, e -> new ArrayList<>() ).add( registration );
+        } finally
+        {
+            lock.unlock();
+        }
     }
 
     public void register(Object listener)
     {
-        Map<Class<?>, Map<Byte, Set<Method>>> handler = findHandlers( listener );
+        List<EventRegistration> pendingRegistrations = discoverRegistrationsFor( listener );
+
         lock.lock();
         try
         {
-            for ( Map.Entry<Class<?>, Map<Byte, Set<Method>>> e : handler.entrySet() )
+            for ( EventRegistration registration : pendingRegistrations )
             {
-                Map<Byte, Map<Object, Method[]>> prioritiesMap = byListenerAndPriority.get( e.getKey() );
-                if ( prioritiesMap == null )
-                {
-                    prioritiesMap = new HashMap<>();
-                    byListenerAndPriority.put( e.getKey(), prioritiesMap );
-                }
-                for ( Map.Entry<Byte, Set<Method>> entry : e.getValue().entrySet() )
-                {
-                    Map<Object, Method[]> currentPriorityMap = prioritiesMap.get( entry.getKey() );
-                    if ( currentPriorityMap == null )
-                    {
-                        currentPriorityMap = new HashMap<>();
-                        prioritiesMap.put( entry.getKey(), currentPriorityMap );
-                    }
-                    currentPriorityMap.put( listener, entry.getValue().toArray( new Method[ 0 ] ) );
-                }
-                bakeHandlers( e.getKey() );
+                register( registration );
+            }
+
+            List<EventRegistration> currentRegistrations = byListener.get( listener );
+
+            if ( currentRegistrations == null )
+            {
+                byListener.put( listener, pendingRegistrations );
+            } else
+            {
+                currentRegistrations.addAll( pendingRegistrations );
             }
         } finally
         {
             lock.unlock();
+        }
+    }
+
+    private void register(EventRegistration registration)
+    {
+        EventRegistration[] currentRegistrations = byEventSorted.get( registration.eventClass );
+
+        if ( currentRegistrations == null )
+        {
+            byEventSorted.put( registration.eventClass, new EventRegistration[]
+            {
+                registration
+            } );
+        } else
+        {
+            System.out.println( Arrays.toString( currentRegistrations ) );
+            int index = Arrays.binarySearch( currentRegistrations, registration, PRIORITY_COMPARATOR );
+
+            if ( index < 0 )
+            {
+                index = -index - 1;
+            }
+
+            EventRegistration[] newRegistrations = new EventRegistration[ currentRegistrations.length + 1 ];
+            System.arraycopy( currentRegistrations, 0, newRegistrations, 0, index );
+            newRegistrations[ index ] = registration;
+            System.arraycopy( currentRegistrations, index, newRegistrations, index + 1, currentRegistrations.length - index );
+
+            byEventSorted.put( registration.eventClass, newRegistrations );
         }
     }
 
     public void unregister(Object listener)
     {
-        Map<Class<?>, Map<Byte, Set<Method>>> handler = findHandlers( listener );
+        List<EventRegistration> registrations = byListener.get( listener );
+
+        if ( registrations == null )
+            return;
+
         lock.lock();
         try
         {
-            for ( Map.Entry<Class<?>, Map<Byte, Set<Method>>> e : handler.entrySet() )
+            for ( EventRegistration registration : registrations )
             {
-                Map<Byte, Map<Object, Method[]>> prioritiesMap = byListenerAndPriority.get( e.getKey() );
-                if ( prioritiesMap != null )
+                EventRegistration[] currentRegistrations = byEventSorted.get( registration.eventClass );
+
+                if ( currentRegistrations.length == 1 )
                 {
-                    for ( Byte priority : e.getValue().keySet() )
+                    byEventSorted.remove( registration.eventClass );
+                } else
+                {
+                    EventRegistration[] newRegistrations = new EventRegistration[ currentRegistrations.length - 1 ];
+                    int i = 0;
+
+                    for ( EventRegistration currentRegistration : currentRegistrations )
                     {
-                        Map<Object, Method[]> currentPriority = prioritiesMap.get( priority );
-                        if ( currentPriority != null )
+                        if ( currentRegistration != registration )
                         {
-                            currentPriority.remove( listener );
-                            if ( currentPriority.isEmpty() )
-                            {
-                                prioritiesMap.remove( priority );
-                            }
+                            newRegistrations[i++] = currentRegistration;
                         }
                     }
-                    if ( prioritiesMap.isEmpty() )
-                    {
-                        byListenerAndPriority.remove( e.getKey() );
-                    }
+
+                    byEventSorted.put( registration.eventClass, newRegistrations );
                 }
-                bakeHandlers( e.getKey() );
             }
         } finally
         {
@@ -163,42 +191,12 @@ public class EventBus
         }
     }
 
-    /**
-     * Shouldn't be called without first locking the writeLock; intended for use
-     * only inside {@link #register(java.lang.Object) register(Object)} or
-     * {@link #unregister(java.lang.Object) unregister(Object)}.
-     *
-     * @param eventClass event class
-     */
-    private void bakeHandlers(Class<?> eventClass)
+    @Value
+    private static class EventRegistration
     {
-        Map<Byte, Map<Object, Method[]>> handlersByPriority = byListenerAndPriority.get( eventClass );
-        if ( handlersByPriority != null )
-        {
-            List<EventHandlerMethod> handlersList = new ArrayList<>( handlersByPriority.size() * 2 );
-
-            // Either I'm really tired, or the only way we can iterate between Byte.MIN_VALUE and Byte.MAX_VALUE inclusively,
-            // with only a byte on the stack is by using a do {} while() format loop.
-            byte value = Byte.MIN_VALUE;
-            do
-            {
-                Map<Object, Method[]> handlersByListener = handlersByPriority.get( value );
-                if ( handlersByListener != null )
-                {
-                    for ( Map.Entry<Object, Method[]> listenerHandlers : handlersByListener.entrySet() )
-                    {
-                        for ( Method method : listenerHandlers.getValue() )
-                        {
-                            EventHandlerMethod ehm = new EventHandlerMethod( listenerHandlers.getKey(), method );
-                            handlersList.add( ehm );
-                        }
-                    }
-                }
-            } while ( value++ < Byte.MAX_VALUE );
-            byEventBaked.put( eventClass, handlersList.toArray( new EventHandlerMethod[ 0 ] ) );
-        } else
-        {
-            byEventBaked.remove( eventClass );
-        }
+        Object listener;
+        Class<?> eventClass;
+        byte priority;
+        EventExecutor<?> executor;
     }
 }
